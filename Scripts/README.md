@@ -1,6 +1,6 @@
 # 顺丰速运 会员签到（Surge 脚本）
 
-每天定时自动完成顺丰速运会员签到，无需打开 App。
+每天定时自动完成顺丰速运会员签到，**无需打开 App**。
 
 > 顺丰会员中心的 H5 登录态（sessionId）只有约 20 分钟有效期，社区脚本普遍只能"打开 App 时顺手签"。
 > 本方案利用 App 的原生登录凭证（长期有效）在每次定时运行时**现签发现新的 H5 登录令牌**，
@@ -10,7 +10,7 @@
 
 | 文件 | 类型 | 作用 |
 | --- | --- | --- |
-| `sf-capture.js` | http-request | ① 捕获 `universalSign` 请求（原生长期凭证 token 等）② 捕获会员中心 H5 会话（备用） |
+| `sf-capture.js` | http-request | ① 捕获 `universalSign` 请求（原生长期凭证 token 等，打开 App 签到页时自动发生）② 捕获会员中心 H5 会话（备用） |
 | `sf-signin.js` | cron | 原生凭证 → 换取 H5 登录令牌 → 换取新会话 → 调用签到接口 → 通知结果 |
 
 ## Surge 配置（Mac / iOS 通用）
@@ -26,12 +26,14 @@ hostname = *.sf-express.com, *.sf-express.com.cn
 **2. 脚本注册**（`[Script]` 段）：
 
 ```text
-顺丰速运·登录凭证捕获 = type=http-request,pattern=^https?://ccsp-egmas\.sf-express\.com/cx-app-member/member/app/user/universalSign,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-capture.js,requires-body=true,timeout=30
-顺丰速运·H5参数捕获 = type=http-request,pattern=^https?://mcs-mimp-web\.sf-express\.com/,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-capture.js,timeout=30
-顺丰速运·每日签到 = type=cron,cronexp=5 8 * * *,wake-system=1,timeout=60,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-signin.js
-顺丰速运·补签重试 = type=cron,cronexp=5 12 * * *,wake-system=1,timeout=60,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-signin.js
-顺丰速运·补签重试2 = type=cron,cronexp=5 18 * * *,wake-system=1,timeout=60,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-signin.js
+顺丰速运·登录凭证捕获 = type=http-request,pattern=^https?://ccsp-egmas\.sf-express\.com/cx-app-member/member/app/user/universalSign,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-capture.js?v=20261017c,requires-body=true,timeout=30
+顺丰速运·H5参数捕获 = type=http-request,pattern=^https?://mcs-mimp-web\.sf-express\.com/,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-capture.js?v=20261017c,timeout=30
+顺丰速运·每日签到 = type=cron,cronexp=5 8 * * *,wake-system=1,timeout=60,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-signin.js?v=20261017c
+顺丰速运·补签重试 = type=cron,cronexp=5 12 * * *,wake-system=1,timeout=60,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-signin.js?v=20261017c
+顺丰速运·补签重试2 = type=cron,cronexp=5 18 * * *,wake-system=1,timeout=60,script-path=https://raw.githubusercontent.com/JohnWJ-co/surge-self-rules/refs/heads/main/Scripts/sf-signin.js?v=20261017c
 ```
+
+> 更新脚本后请修改 `?v=` 后的版本号并重载配置，Surge 才会重新拉取云端脚本（Surge 会缓存远程脚本）。
 
 **3. 首次使用**：打开一次顺丰速运 App 的「签到」或「会员中心」页面（几秒钟即可），
 脚本会自动捕获登录凭证。之后每天的签到全自动完成，无需再打开 App。
