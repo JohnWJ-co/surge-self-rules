@@ -157,7 +157,8 @@ function fetchSession(loginToken, cb) {
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'Accept-Language': 'zh-CN,zh-Hans;q=0.9'
     },
-    timeout: 20
+    timeout: 20,
+    'auto-redirect': false
   }, function (err, resp, data) {
     if (err) { cb({ step: 'activityRedirect', netError: String(err) }); return; }
     var sc = getHeader(resp && resp.headers, 'set-cookie');
