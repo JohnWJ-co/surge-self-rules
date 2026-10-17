@@ -1,20 +1,25 @@
 /***************************************************************
  * 顺丰速运 · 会员签到【定时自动签到】
  * 类型: Surge cron 脚本 (type=cron)
- * 依赖: 参数由 sf-capture.js 在打开顺丰速运 App 时自动捕获刷新
  *
- * 流程: 读取已捕获的登录参数 -> 查询今日签到状态 -> 未签到则签到 -> 通知结果
+ * 原理:
+ *   用捕获的长期原生 token 调 universalSign 换取一次性 H5 登录令牌
+ *   -> activityRedirect 换取全新的 H5 sessionId (绕开 H5 会话约 20 分钟过期的限制)
+ *   -> 调会员中心签到接口完成签到。
+ *   全程无需打开 App；凭证由 sf-capture.js 在打开 App 签到页时自动刷新。
  ***************************************************************/
 
 var BASE = 'https://mcs-mimp-web.sf-express.com';
-var API_GET_TODAY = BASE + '/mcs-mimp/commonPost/~memberNonactivity~integralSignV2Service~getTodaySign';
-var API_SIGN = BASE + '/mcs-mimp/commonPost/~memberNonactivity~integralSignV2Service~sign';
+var U_UNIVERSAL = 'https://ccsp-egmas.sf-express.com/cx-app-member/member/app/user/universalSign';
+var U_REDIRECT = BASE + '/mcs-mimp/share/app/activityRedirect';
+var U_SIGN = BASE + '/mcs-mimp/commonPost/~memberNonactivity~integralSignV2Service~sign';
+var H5_UA = 'Mozilla/5.0 (iPad; CPU OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 mediaCode=SFEXPRESSAPP-iOS-ML';
 
-var K_SESSION = 'sf_express_session';      // JSON: {cookie, deviceid, mobile, userId, ts}
-var K_SIGN_DATE = 'sf_express_sign_date';  // 已完成签到的服务器日期 YYYY-MM-DD
+var K_NATIVE = 'sf_express_native';        // {headers:{...}, body:'...', ts}
+var K_SIGN_DATE = 'sf_express_sign_date';  // 已完成签到的日期 YYYY-MM-DD
 var K_NOTIFY_FAIL = 'sf_express_notify_fail'; // 失败通知日期（每天最多提醒一次）
 
-/* ============================ 公共核心 ============================ */
+/* ============================ 工具 ============================ */
 function md5(input) {
   function add32(a, b) { return (a + b) & 0xFFFFFFFF; }
   function cmn(q, a, b, x, s, t) { a = add32(add32(a, q), add32(x, t)); return add32((a << s) | (a >>> (32 - s)), b); }
@@ -82,16 +87,8 @@ function md5(input) {
   return out;
 }
 
-function makeSignature(ts) {
-  return md5('token=wwesldfs29aniversaryvdld29&timestamp=' + ts + '&sysCode=MCS-MIMP-CORE');
-}
-
-function readStore(key) {
-  try { return $persistentStore.read(key); } catch (e) { return null; }
-}
-function writeStore(key, value) {
-  try { return $persistentStore.write(String(value), key); } catch (e) { return false; }
-}
+function readStore(key) { try { return $persistentStore.read(key); } catch (e) { return null; } }
+function writeStore(key, value) { try { return $persistentStore.write(String(value), key); } catch (e) { return false; } }
 function readJSON(key) {
   var raw = readStore(key);
   if (!raw) return null;
@@ -107,49 +104,99 @@ function timeStr() {
   var h = d.getHours(), m = d.getMinutes();
   return (h < 10 ? '0' + h : h) + ':' + (m < 10 ? '0' + m : m);
 }
+function notifyFailOnce(subtitle, body) {
+  var today = localDateStr();
+  if (readStore(K_NOTIFY_FAIL) === today) {
+    console.log('[SF:定时] 今日已提醒过失败(' + subtitle + ')，跳过重复通知');
+    return;
+  }
+  writeStore(K_NOTIFY_FAIL, today);
+  $notification.post('顺丰速运 · 签到失败', subtitle, body);
+}
+function parseJSON(data) {
+  try { return JSON.parse(data); } catch (e) { return null; }
+}
+function getHeader(headers, name) {
+  if (!headers) return '';
+  for (var k in headers) {
+    if (k.toLowerCase() === name) return headers[k];
+  }
+  return '';
+}
 
-function buildHeaders(cookie, deviceid, ts) {
-  var h = {
+/* ============================ 签到链路 ============================ */
+// 1) 原生 universalSign -> 一次性 H5 登录令牌
+function getLoginToken(native, cb) {
+  $httpClient.post({
+    url: U_UNIVERSAL,
+    headers: native.headers,
+    body: native.body,
+    timeout: 20
+  }, function (err, resp, data) {
+    if (err) { cb({ step: 'universalSign', netError: String(err) }); return; }
+    var j = parseJSON(data);
+    if (!j) { cb({ step: 'universalSign', netError: 'HTTP ' + (resp && resp.status) + ' 响应异常' }); return; }
+    if (!j.success || !j.obj || !j.obj.sign) {
+      cb({ step: 'universalSign', code: j.errorCode, message: j.errorMessage || '获取登录令牌失败' });
+      return;
+    }
+    cb(null, j.obj.sign);
+  });
+}
+
+// 2) activityRedirect -> 全新的 H5 sessionId
+function fetchSession(loginToken, cb) {
+  var biz = JSON.stringify({ path: '/up-member/newHome', autoSignIn: '1', supportShare: 'YES', tab: '2', from: 'autoappicon' });
+  var url = U_REDIRECT + '?sign=' + encodeURIComponent(loginToken) +
+    '&source=SFAPP&bizCode=' + encodeURIComponent(biz) +
+    '&citycode=553&cityname=' + encodeURIComponent('芜湖');
+  $httpClient.get({
+    url: url,
+    headers: {
+      'User-Agent': H5_UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh-Hans;q=0.9'
+    },
+    timeout: 20
+  }, function (err, resp, data) {
+    if (err) { cb({ step: 'activityRedirect', netError: String(err) }); return; }
+    var sc = getHeader(resp && resp.headers, 'set-cookie');
+    if (Array.isArray(sc)) sc = sc.join('\n');
+    var m = /sessionId=([0-9a-fA-F]+)/.exec(String(sc || ''));
+    if (!m) { cb({ step: 'activityRedirect', netError: '未获取到会话(Set-Cookie), HTTP ' + (resp && resp.status) }); return; }
+    cb(null, m[1]);
+  });
+}
+
+// 3) 用新会话签到
+function doSign(sessionId, deviceid, cb) {
+  var ts = Date.now();
+  var sig = md5('token=wwesldfs29aniversaryvdld29&timestamp=' + ts + '&sysCode=MCS-MIMP-CORE');
+  var headers = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/plain, */*',
     'Origin': BASE,
     'Referer': BASE + '/up-member/newHome',
-    'User-Agent': 'Mozilla/5.0 (iPad; CPU OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 mediaCode=SFEXPRESSAPP-iOS-ML',
+    'User-Agent': H5_UA,
     'channel': 'autoappicon',
     'syscode': 'MCS-MIMP-CORE',
     'platform': 'SFAPP',
     'timestamp': String(ts),
-    'signature': makeSignature(ts),
+    'signature': sig,
     'accept-language': 'zh-CN,zh-Hans;q=0.9',
-    'sec-fetch-site': 'same-origin',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-dest': 'empty',
-    'Cookie': cookie
+    'Cookie': 'sessionId=' + sessionId
   };
-  if (deviceid) h['deviceid'] = deviceid;
-  return h;
-}
-
-function postJSON(url, cookie, deviceid, cb) {
-  var ts = Date.now();
+  if (deviceid) headers['deviceid'] = deviceid;
   $httpClient.post({
-    url: url,
-    headers: buildHeaders(cookie, deviceid, ts),
+    url: U_SIGN,
+    headers: headers,
     body: '{}',
     timeout: 20
   }, function (err, resp, data) {
-    if (err) {
-      cb({ netError: String(err) }, null);
-      return;
-    }
-    var status = resp && resp.status ? resp.status : 0;
-    var obj = null;
-    try { obj = JSON.parse(data); } catch (e) { obj = null; }
-    if (!obj) {
-      cb({ netError: 'HTTP ' + status + ' 响应异常' }, null);
-      return;
-    }
-    cb(null, obj);
+    if (err) { cb({ step: 'sign', netError: String(err) }); return; }
+    var j = parseJSON(data);
+    if (!j) { cb({ step: 'sign', netError: 'HTTP ' + (resp && resp.status) + ' 响应异常' }); return; }
+    cb(null, j);
   });
 }
 
@@ -166,95 +213,78 @@ function extractAwardNum(obj) {
   return null;
 }
 
-function serverDate(respDate) {
-  if (respDate && typeof respDate === 'string' && respDate.length >= 10) return respDate.substring(0, 10);
-  return localDateStr();
-}
-
-/* 失败通知：每天最多一条，避免多个定时重试重复提醒 */
-function notifyFailOnce(subtitle, body) {
-  var today = localDateStr();
-  if (readStore(K_NOTIFY_FAIL) === today) {
-    console.log('[SF:定时] 今日已提醒过失败(' + subtitle + ')，跳过重复通知');
-    return;
-  }
-  writeStore(K_NOTIFY_FAIL, today);
-  $notification.post('顺丰速运 · 签到失败', subtitle, body);
-}
-
-/* ============================ 脚本主体 ============================ */
+/* ============================ 主流程 ============================ */
 (function () {
   console.log('[SF:定时] ===== 顺丰速运定时签到 开始 =====');
-  var session = readJSON(K_SESSION);
-  if (!session || !session.cookie) {
-    console.log('[SF:定时] 尚未获取登录参数');
-    notifyFailOnce('尚未获取登录参数', '请打开一次顺丰速运 App（脚本会自动捕获账号参数）');
+  var today = localDateStr();
+  if (readStore(K_SIGN_DATE) === today) {
+    console.log('[SF:定时] 今日已签到(' + today + ')，跳过');
     $done();
     return;
   }
 
-  var guardDate = readStore(K_SIGN_DATE);
-  if (guardDate === localDateStr()) {
-    console.log('[SF:定时] 今日已签到（' + guardDate + '），跳过');
+  var native = readJSON(K_NATIVE);
+  if (!native || !native.headers || !native.headers.token || !native.body) {
+    console.log('[SF:定时] 尚未捕获登录凭证');
+    notifyFailOnce('尚未获取登录凭证', '请打开一次顺丰速运 App 的「签到/会员中心」页面（会自动捕获凭证）');
     $done();
     return;
   }
+  console.log('[SF:定时] 凭证捕获时间: ' + new Date(parseInt(native.ts, 10) || 0).toLocaleString());
 
-  console.log('[SF:定时] 使用捕获参数' + (session.mobile ? '（' + session.mobile + '）' : '') +
-    ' 捕获时间: ' + new Date(parseInt(session.ts, 10) || 0).toLocaleString());
-
-  postJSON(API_GET_TODAY, session.cookie, session.deviceid, function (err, today) {
-    if (err) {
-      console.log('[SF:定时] 状态查询失败: ' + err.netError);
-      notifyFailOnce('查询签到状态失败', err.netError);
+  getLoginToken(native, function (e1, loginToken) {
+    if (e1) {
+      console.log('[SF:定时] 换取登录令牌失败: ' + JSON.stringify(e1));
+      notifyFailOnce('登录凭证已失效', '请打开一次顺丰速运 App 的「签到/会员中心」页面刷新凭证');
       $done();
       return;
     }
+    console.log('[SF:定时] 登录令牌获取成功');
 
-    if (today.success && today.obj && today.obj.signed === true) {
-      writeStore(K_SIGN_DATE, serverDate(today.date));
-      var d1 = today.obj.dayCount || 0;
-      console.log('[SF:定时] 今日已签到 连签' + d1 + '天');
-      $notification.post('顺丰速运 · 签到', '今日已签到', '连签 ' + d1 + ' 天 · ' + timeStr());
-      $done();
-      return;
-    }
-
-    if (String(today.errorCode) === '100111') {
-      console.log('[SF:定时] 登录态失效: ' + today.errorMessage);
-      notifyFailOnce('登录态已失效', '请打开一次顺丰速运 App 刷新参数（下次定时会自动补签）');
-      $done();
-      return;
-    }
-
-    console.log('[SF:定时] 今日未签到，执行签到...');
-    postJSON(API_SIGN, session.cookie, session.deviceid, function (err2, res) {
-      if (err2) {
-        console.log('[SF:定时] 签到请求失败: ' + err2.netError);
-        notifyFailOnce('网络请求失败', err2.netError);
+    fetchSession(loginToken, function (e2, sessionId) {
+      if (e2) {
+        console.log('[SF:定时] 换取 H5 会话失败: ' + JSON.stringify(e2));
+        notifyFailOnce('登录会话获取失败', (e2.netError || (e2.message || '')) + ' · 请打开顺丰速运App签到页一次');
         $done();
         return;
       }
-      if (res.success) {
-        var award = extractAwardNum(res.obj || {});
-        var days = (res.obj && res.obj.dayCount) ? res.obj.dayCount : (today.obj && today.obj.dayCount ? today.obj.dayCount : 0);
-        writeStore(K_SIGN_DATE, serverDate(res.date));
-        var msg = (award !== null && award !== undefined) ? ('积分 +' + award) : '签到成功';
-        console.log('[SF:定时] 签到成功 ' + msg + ' 连签' + days + '天');
-        $notification.post('顺丰速运 · 签到成功', msg, '连签 ' + days + ' 天 · ' + timeStr());
+      console.log('[SF:定时] 已获取全新 H5 会话: ' + sessionId.substring(0, 8) + '...');
+
+      var deviceid = native.headers.srcdeviceguid || '';
+      doSign(sessionId, deviceid, function (e3, res) {
+        if (e3) {
+          console.log('[SF:定时] 签到请求失败: ' + JSON.stringify(e3));
+          notifyFailOnce('签到请求失败', e3.netError || '网络异常');
+          $done();
+          return;
+        }
+        if (res.success) {
+          var award = extractAwardNum(res.obj || {});
+          var days = (res.obj && res.obj.dayCount) ? res.obj.dayCount : 0;
+          writeStore(K_SIGN_DATE, today);
+          var msg = (award !== null && award !== undefined) ? ('积分 +' + award) : '签到成功';
+          console.log('[SF:定时] 签到成功 ' + msg + ' 连签' + days + '天');
+          $notification.post('顺丰速运 · 签到成功', msg, '连签 ' + days + ' 天 · ' + timeStr());
+          $done();
+          return;
+        }
+        if (String(res.errorCode) === '3400002') {
+          writeStore(K_SIGN_DATE, today);
+          console.log('[SF:定时] 今日已签到(接口返回)');
+          $notification.post('顺丰速运 · 签到', '今日已签到', String(res.errorMessage || ''));
+          $done();
+          return;
+        }
+        if (String(res.errorCode) === '100111') {
+          console.log('[SF:定时] 会话异常: ' + res.errorMessage);
+          notifyFailOnce('登录会话异常', '请打开一次顺丰速运 App 的「签到/会员中心」页面刷新凭证');
+          $done();
+          return;
+        }
+        console.log('[SF:定时] 签到失败: ' + res.errorCode + ' ' + res.errorMessage);
+        notifyFailOnce(String(res.errorMessage || '未知错误'), '错误码 ' + res.errorCode);
         $done();
-        return;
-      }
-      if (String(res.errorCode) === '3400002') {
-        writeStore(K_SIGN_DATE, serverDate(res.date));
-        console.log('[SF:定时] 今日已签到(接口返回)');
-        $notification.post('顺丰速运 · 签到', '今日已签到', String(res.errorMessage || ''));
-        $done();
-        return;
-      }
-      console.log('[SF:定时] 签到失败: ' + res.errorCode + ' ' + res.errorMessage);
-      notifyFailOnce(String(res.errorMessage || '未知错误'), '错误码 ' + res.errorCode);
-      $done();
+      });
     });
   });
 })();
