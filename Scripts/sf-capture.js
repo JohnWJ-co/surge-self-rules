@@ -50,6 +50,7 @@ function readJSON(key) {
   if (url.indexOf('universalSign') !== -1) {
     var body = ($request && $request.body) ? $request.body : '';
     var token = getH('token');
+    console.log('[SF:凭证] 命中 universalSign, body长度=' + body.length + ', token=' + (token ? '有' : '无'));
     if (body && token && body.indexOf('mcs-mimp-web') !== -1) {
       var kept = {};
       for (var i = 0; i < KEEP_HEADERS.length; i++) {
@@ -60,8 +61,12 @@ function readJSON(key) {
       var newN = JSON.stringify({ headers: kept, body: body, ts: Date.now() });
       if (oldN !== newN) {
         writeStore(K_NATIVE, newN);
-        console.log('[SF:凭证] 原生登录令牌已更新 设备:' + (kept.deviceid || '') + ' token:' + token.substring(0, 8) + '...');
+        console.log('[SF:凭证] 原生登录令牌已更新 设备:' + (kept.deviceid || '') + ' token:' + token.substring(0, 8) + '... body长度:' + body.length);
+      } else {
+        console.log('[SF:凭证] 凭证无变化，跳过保存');
       }
+    } else {
+      console.log('[SF:凭证] 未保存: body/token 缺失或目标不匹配');
     }
     $done({});
     return;
